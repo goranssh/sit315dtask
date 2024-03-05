@@ -1,0 +1,135 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <queue>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <vector>
+#include <algorithm>
+#include <atomic>
+#include <iomanip>
+
+// Structure to represent traffic signal data
+struct TrafficData {
+    std::string timeStamp;
+    int trafficLightID;
+    int carDensity;
+};
+
+class TrafficControl {
+private:
+    std::queue<TrafficData> trafficQueue;
+    std::mutex mutex;
+    std::condition_variable producerCV, consumerCV;
+    std::vector<TrafficData> topCongestedLights;
+    std::atomic<bool> isProducerDone{false}; // Flag to indicate producer completion
+
+    const int maxQueueSize = 100; // Maximum capacity of the traffic queue
+    const int topCongestionLights = 3; // Top N congested traffic lights to track
+
+public:
+    // Producer function to read traffic data from file and push it to the queue
+    void producer(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "Error opening file: " << filename << std::endl;
+            return;
+        }
+
+        std::string line;
+        while (std::getline(file, line)) {
+            std::istringstream iss(line);
+            TrafficData data;
+            int hour, minute, second;
+            char delimiter;
+            if (!(iss >> hour >> delimiter >> minute >> delimiter >> second >> data.trafficLightID >> data.carDensity)) {
+                std::cerr << "Error reading line: " << line << std::endl;
+                continue;
+            }
+            std::ostringstream oss;
+            oss << std::setw(2) << std::setfill('0') << hour << ":" << std::setw(2) << std::setfill('0') << minute << ":" << std::setw(2) << std::setfill('0') << second;
+            data.timeStamp = oss.str();
+
+            std::unique_lock<std::mutex> lock(mutex);
+            producerCV.wait(lock, [this]() { return trafficQueue.size() < maxQueueSize; });
+
+            trafficQueue.push(data);
+            std::cout << "Producer: Read traffic data - timeStamp: " << data.timeStamp << ", Light ID: " << data.trafficLightID << ", Car density: " << data.carDensity << std::endl;
+
+            consumerCV.notify_all();
+        }
+        isProducerDone = true;
+        consumerCV.notify_all(); 
+    }
+
+    void consumer(int numConsumers) {
+        while (true) {
+            std::unique_lock<std::mutex> lock(mutex);
+            consumerCV.wait(lock, [this]() { return !trafficQueue.empty() || isProducerDone; });
+
+            if (trafficQueue.empty() && isProducerDone) {
+                break;
+            }
+
+            TrafficData data = trafficQueue.front();
+            trafficQueue.pop();
+            lock.unlock();
+
+            processTrafficData(data);
+
+            producerCV.notify_all();
+        }
+    }
+
+    void processTrafficData(const TrafficData& data) {
+        if (topCongestedLights.size() < topCongestionLights) {
+            topCongestedLights.push_back(data);
+        } else {
+            auto minElement = std::min_element(topCongestedLights.begin(), topCongestedLights.end(),
+                [](const TrafficData& a, const TrafficData& b) { return a.carDensity < b.carDensity; });
+            if (data.carDensity > minElement->carDensity) {
+                *minElement = data;
+            }
+        }
+
+        std::sort(topCongestedLights.begin(), topCongestedLights.end(),
+            [](const TrafficData& a, const TrafficData& b) { return a.carDensity > b.carDensity; });
+
+        std::cout << "Consumer: Updated top congested lights list - ";
+        for (const auto& light : topCongestedLights) {
+            std::cout << "(Light ID: " << light.trafficLightID << ", Car density: " << light.carDensity << ") ";
+        }
+        std::cout << std::endl;
+    }
+
+    void startSimulation(const std::string& filename, int numConsumers) {
+        std::vector<std::thread> producerThreads, consumerThreads;
+
+        producerThreads.emplace_back([this, filename]() {
+            this->producer(filename);
+        });
+
+        for (int i = 0; i < numConsumers; ++i) {
+            consumerThreads.emplace_back([this, numConsumers]() {
+                this->consumer(numConsumers);
+            });
+        }
+
+        for (auto& thread : producerThreads) {
+            thread.join();
+        }
+
+        for (auto& thread : consumerThreads) {
+            thread.join();
+        }
+    }
+};
+
+int main() {
+    TrafficControl simulator;
+    std::string filename = "data.txt"; 
+    int numConsumers = 5; 
+    simulator.startSimulation(filename, numConsumers);
+    return 0;
+}
